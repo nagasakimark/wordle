@@ -4,19 +4,37 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>New Horizon Wordle</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@500;700;800&family=Nunito:wght@800;900&display=swap" rel="stylesheet">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='18' fill='%236aaa64'/><text x='50' y='74' font-size='70' text-anchor='middle' fill='white' font-family='Arial' font-weight='bold'>W</text></svg>">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
+    <canvas id="confetti"></canvas>
+
     <div class="container">
         <header>
-            <h1>NEW HORIZON WORDLE</h1>
-            <div class="menu-buttons">
-                <button id="how-to-play">?</button>
-                <button id="statistics">📊</button>
+            <div class="menu-buttons left">
+                <button id="how-to-play" title="あそびかた">❓</button>
+                <button id="sound-toggle" title="おと">🔊</button>
+            </div>
+            <h1 aria-label="New Horizon Wordle">
+                <span class="logo-tile g">N</span><span class="logo-tile y">E</span><span class="logo-tile g">W</span>
+                <span class="logo-word">HORIZON WORDLE</span>
+            </h1>
+            <div class="menu-buttons right">
+                <button id="statistics" title="きろく">📊</button>
             </div>
         </header>
 
-        <div id="message-container"></div>
+        <div class="sub-bar">
+            <span id="mode-badge" class="mode-badge daily">📅 きょうの ことば</span>
+            <div id="hint-box" class="hint-box"></div>
+            <button id="hint-btn" class="hint-btn" disabled>💡 ヒント</button>
+        </div>
+
+        <div id="message-container" role="status" aria-live="polite"></div>
 
         <div id="game-container">
             <div id="board-container">
@@ -37,7 +55,7 @@
                     <button data-key="p">p</button>
                 </div>
                 <div class="keyboard-row">
-                    <div class="spacer half"></div>
+                    <div class="spacer"></div>
                     <button data-key="a">a</button>
                     <button data-key="s">s</button>
                     <button data-key="d">d</button>
@@ -47,7 +65,7 @@
                     <button data-key="j">j</button>
                     <button data-key="k">k</button>
                     <button data-key="l">l</button>
-                    <div class="spacer half"></div>
+                    <div class="spacer"></div>
                 </div>
                 <div class="keyboard-row">
                     <button data-key="enter" class="wide-button">Enter</button>
@@ -58,96 +76,84 @@
                     <button data-key="b">b</button>
                     <button data-key="n">n</button>
                     <button data-key="m">m</button>
-                    <button data-key="backspace" class="wide-button">⌫</button>
+                    <button data-key="backspace" class="wide-button" aria-label="けす">⌫</button>
                 </div>
             </div>
         </div>
 
+        <!-- How to play -->
         <div class="modal" id="instructions-modal">
             <div class="modal-content">
-                <span class="close">&times;</span>
-                <h2>遊び方</h2>
-                <p>WORDLEを当てるまで何回でも挑戦できます。</p>
-                <p>各挑戦は5文字の有効な単語でなければなりません。</p>
-                <p>5文字を入力すると、自動的に単語が確定します。</p>
-                <p>各挑戦後、タイルの色が変わり、推測がどれだけ単語に近いかを示します。</p>
+                <span class="close" title="とじる">&times;</span>
+                <h2>あそびかた</h2>
+                <p class="lead">5もじの えいごの ことばを あてよう！<br>なんかい でも チャレンジ できるよ。</p>
+                <p>5もじ いれると じどうで けってい するよ。</p>
                 <div class="examples">
-                    <p><strong>例</strong></p>
                     <div class="example">
-                        <div class="tile correct">W</div>
-                        <div class="tile">E</div>
-                        <div class="tile">A</div>
-                        <div class="tile">R</div>
-                        <div class="tile">Y</div>
-                        <p>「W」は単語内の正しい位置にあります。</p>
+                        <div class="tiles"><div class="tile correct">W</div><div class="tile">E</div><div class="tile">A</div><div class="tile">R</div><div class="tile">Y</div></div>
+                        <p><span class="swatch correct"></span><b>みどり</b> ＝ ばしょも もじも あってる！</p>
                     </div>
                     <div class="example">
-                        <div class="tile">P</div>
-                        <div class="tile present">I</div>
-                        <div class="tile">L</div>
-                        <div class="tile">O</div>
-                        <div class="tile">T</div>
-                        <p>「I」は単語内にありますが、位置が間違っています。</p>
+                        <div class="tiles"><div class="tile">P</div><div class="tile present">I</div><div class="tile">L</div><div class="tile">O</div><div class="tile">T</div></div>
+                        <p><span class="swatch present"></span><b>きいろ</b> ＝ もじは あるけど ばしょが ちがう</p>
                     </div>
                     <div class="example">
-                        <div class="tile">V</div>
-                        <div class="tile">A</div>
-                        <div class="tile">G</div>
-                        <div class="tile absent">U</div>
-                        <div class="tile">E</div>
-                        <p>「U」は単語内のどの位置にも存在しません。</p>
+                        <div class="tiles"><div class="tile">V</div><div class="tile">A</div><div class="tile">G</div><div class="tile absent">U</div><div class="tile">E</div></div>
+                        <p><span class="swatch absent"></span><b>はいいろ</b> ＝ この もじは ないよ</p>
                     </div>
                 </div>
+                <p class="tip">💡 こまったら <b>ヒント</b> を おしてね（3かい まちがえると つかえるよ）</p>
+                <p class="tip">🎯 きょうの ことばが おわったら <b>れんしゅう</b> で もっと あそべるよ！</p>
+                <button id="start-btn" class="big-btn green">はじめる！</button>
             </div>
         </div>
 
+        <!-- Stats -->
         <div class="modal" id="statistics-modal">
             <div class="modal-content">
-                <span class="close">&times;</span>
-                <h2>統計</h2>
+                <span class="close" title="とじる">&times;</span>
+                <h2>きろく</h2>
                 <div class="statistics-container">
-                    <div class="statistic">
-                        <div class="statistic-number" id="played">0</div>
-                        <div class="statistic-label">プレイ回数</div>
-                    </div>
-                    <div class="statistic">
-                        <div class="statistic-number" id="win-percentage">0</div>
-                        <div class="statistic-label">勝率 %</div>
-                    </div>
-                    <div class="statistic">
-                        <div class="statistic-number" id="current-streak">0</div>
-                        <div class="statistic-label">現在の連勝</div>
-                    </div>
-                    <div class="statistic">
-                        <div class="statistic-number" id="max-streak">0</div>
-                        <div class="statistic-label">最大連勝</div>
-                    </div>
+                    <div class="statistic"><div class="statistic-number" id="played">0</div><div class="statistic-label">あそんだ かず</div></div>
+                    <div class="statistic"><div class="statistic-number" id="win-percentage">0</div><div class="statistic-label">せいかい %</div></div>
+                    <div class="statistic"><div class="statistic-number" id="current-streak">0</div><div class="statistic-label">🔥 れんぞく</div></div>
+                    <div class="statistic"><div class="statistic-number" id="max-streak">0</div><div class="statistic-label">さいこう れんぞく</div></div>
                 </div>
-                <h3>解答分布</h3>
-                <div class="guess-distribution" id="guess-distribution">
-                    <!-- Will be populated by JavaScript -->
-                </div>
+                <h3>なんかいで せいかい した？</h3>
+                <div class="guess-distribution" id="guess-distribution"></div>
                 <div class="countdown-container">
-                    <h3>次のWORDLE</h3>
+                    <h3>つぎの ことばまで</h3>
                     <div id="countdown"></div>
                 </div>
+                <button id="stats-practice-btn" class="big-btn blue">🎯 れんしゅう する</button>
             </div>
         </div>
 
+        <!-- Win -->
         <div id="game-over-modal" class="modal">
-            <div class="modal-content">
-                <span class="close">&times;</span>
-                <h2 id="game-over-message"></h2>
-                <p>正解: <strong id="solution-word"></strong></p>
-                <div class="countdown-container">
-                    <h3>次のWORDLE</h3>
+            <div class="modal-content win">
+                <span class="close" title="とじる">&times;</span>
+                <h2 id="game-over-title"></h2>
+                <p id="game-over-message"></p>
+                <div class="word-card">
+                    <div id="word-emoji" class="word-emoji"></div>
+                    <div id="solution-word" class="word-en"></div>
+                    <div id="word-meaning" class="word-ja"></div>
+                </div>
+                <div id="daily-countdown-box" class="countdown-container">
+                    <h3>つぎの ことばまで</h3>
                     <div id="game-over-countdown"></div>
                 </div>
-                <button id="share-result">結果をシェア</button>
+                <div class="btn-row">
+                    <button id="practice-btn" class="big-btn blue">🎯 れんしゅう</button>
+                    <button id="daily-btn" class="big-btn green">📅 きょうの ことば</button>
+                    <button id="share-result" class="big-btn gray">📋 コピー</button>
+                </div>
             </div>
         </div>
     </div>
 
+    <script src="words.js"></script>
     <script src="game.js"></script>
 </body>
 </html>

@@ -1,678 +1,783 @@
 document.addEventListener('DOMContentLoaded', () => {
-    // Game settings
+    'use strict';
+
+    /* ============================================================
+       SETTINGS
+       ============================================================ */
     const WORD_LENGTH = 5;
-    // No ATTEMPTS constant as we now have infinite attempts
+    const VISIBLE_ROWS = 6;          // rows shown at start (more are added as needed)
+    const HINT_EMOJI_AFTER = 3;      // guesses before the emoji hint unlocks
+    const HINT_MEANING_AFTER = 5;    // guesses before the Japanese meaning unlocks
+    const HINT_LETTER_AFTER = 8;     // guesses before the first-letter hint unlocks
+    const EPOCH = new Date(2025, 0, 1); // used to step through the word list day by day
+
+    const WORD_INFO = window.WORD_INFO || {};
+
+    /* ============================================================
+       STATE
+       ============================================================ */
     let answerWords = [];
-    let allowedGuesses = [];
+    let allowedSet = new Set();
     let solution = '';
     let currentRow = 0;
     let currentTile = 0;
     let gameOver = false;
     let isAnimating = false;
-    let testMode = false; // Flag to indicate test mode
-    
-    // State for statistics
-    let gameStats = getGameStats();
-    let todayGameState = getTodayGameState();
+    let testMode = false;
+    let practiceMode = false;
+    let guesses = [];                // [{word, results}] for the current game
+    let hintsUsed = 0;
+    let messageTimer = null;
 
-    // DOM elements
-    const board = document.getElementById('board');
-    const keyboard = document.getElementById('keyboard-container');
-    const messageContainer = document.getElementById('message-container');
+    let gameStats = loadStats();
+    let todayGameState = loadTodayState();
+    let soundOn = safeGet('wordleSound') !== 'off';
+
+    /* ============================================================
+       DOM
+       ============================================================ */
+    const $ = id => document.getElementById(id);
+    const board = $('board');
+    const boardContainer = $('board-container');
+    const keyboard = $('keyboard-container');
+    const messageContainer = $('message-container');
+    const hintBtn = $('hint-btn');
+    const hintBox = $('hint-box');
+    const modeBadge = $('mode-badge');
     const modals = {
-        instructions: document.getElementById('instructions-modal'),
-        statistics: document.getElementById('statistics-modal'),
-        gameOver: document.getElementById('game-over-modal')
+        instructions: $('instructions-modal'),
+        statistics: $('statistics-modal'),
+        gameOver: $('game-over-modal')
     };
-    const closeButtons = document.querySelectorAll('.close');
-    
-    // Initialize the game
+
+    /* ============================================================
+       STORAGE HELPERS (never crash if storage is blocked)
+       ============================================================ */
+    function safeGet(key) {
+        try { return localStorage.getItem(key); } catch (e) { return null; }
+    }
+    function safeSet(key, value) {
+        try { localStorage.setItem(key, value); } catch (e) { /* ignore */ }
+    }
+
+    function dateKey(d) {
+        return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+    }
+    function todayKey() { return dateKey(new Date()); }
+    function yesterdayKey() {
+        const d = new Date();
+        d.setDate(d.getDate() - 1);
+        return dateKey(d);
+    }
+
+    function loadStats() {
+        const fallback = { played: 0, wins: 0, currentStreak: 0, maxStreak: 0, distribution: {}, lastWinDate: '' };
+        try {
+            const s = JSON.parse(safeGet('wordleStats'));
+            if (s && typeof s === 'object') return Object.assign(fallback, s);
+        } catch (e) { /* ignore */ }
+        return fallback;
+    }
+    function saveStats() {
+        if (testMode || practiceMode) return;
+        safeSet('wordleStats', JSON.stringify(gameStats));
+    }
+
+    function loadTodayState() {
+        try {
+            const s = JSON.parse(safeGet('wordleState'));
+            if (s && s.date === todayKey()) {
+                s.guesses = Array.isArray(s.guesses) ? s.guesses : [];
+                return s;
+            }
+        } catch (e) { /* ignore */ }
+        return { date: '', solution: '', played: false, gameOver: false, won: false, guesses: [], hintsUsed: 0 };
+    }
+    function saveTodayState() {
+        if (testMode || practiceMode) return;
+        todayGameState.guesses = guesses;
+        todayGameState.hintsUsed = hintsUsed;
+        safeSet('wordleState', JSON.stringify(todayGameState));
+    }
+
+    /* ============================================================
+       INIT
+       ============================================================ */
     async function initializeGame() {
-        // Create initial rows for the board
-        createInitialRows();
-        
-        // Add keyboard event listeners
         document.addEventListener('keydown', handleKeyPress);
         keyboard.addEventListener('click', handleKeyClick);
-        
-        // Set up modal controls
-        document.getElementById('how-to-play').addEventListener('click', () => showModal(modals.instructions));
-        document.getElementById('statistics').addEventListener('click', () => {
-            updateStatistics();
-            showModal(modals.statistics);
+        // Stop on-screen keys from keeping focus (otherwise a physical Enter
+        // press would "click" the last on-screen key again).
+        keyboard.addEventListener('mousedown', e => e.preventDefault());
+
+        $('how-to-play').addEventListener('click', () => showModal(modals.instructions));
+        $('statistics').addEventListener('click', () => { updateStatistics(); showModal(modals.statistics); });
+        $('sound-toggle').addEventListener('click', toggleSound);
+        $('share-result').addEventListener('click', shareResults);
+        $('practice-btn').addEventListener('click', startPractice);
+        $('stats-practice-btn').addEventListener('click', startPractice);
+        $('daily-btn').addEventListener('click', startDaily);
+        $('start-btn').addEventListener('click', () => hideModal(modals.instructions));
+        hintBtn.addEventListener('click', useHint);
+
+        document.querySelectorAll('.close').forEach(btn => {
+            btn.addEventListener('click', () => hideModal(btn.closest('.modal')));
         });
-        document.getElementById('share-result').addEventListener('click', shareResults);
-        
-        closeButtons.forEach(button => {
-            button.addEventListener('click', function() {
-                const modal = button.closest('.modal');
-                hideModal(modal);
-            });
+        document.querySelectorAll('.modal').forEach(modal => {
+            modal.addEventListener('click', e => { if (e.target === modal) hideModal(modal); });
         });
 
-        // Load words and set today's word
+        updateSoundButton();
         await loadWords();
-        
-        // Check if test mode is active and indicate it visually
-        if (testMode) {
-            document.querySelector('header h1').style.color = '#c9b458';
-            showMessage('テストモード: ' + solution, 3000);
+        if (!answerWords.length) return;
+
+        // Test mode: ?test=apple
+        const testWord = new URLSearchParams(window.location.search).get('test');
+        if (testWord && /^[a-zA-Z]{5}$/.test(testWord)) {
+            testMode = true;
+            solution = testWord.toLowerCase();
+            resetBoard();
+            document.querySelector('header h1').classList.add('test');
+            showMessage('テストモード: ' + solution.toUpperCase(), 3000);
+            return;
         }
-        
-        // Check if we already played today
-        if (todayGameState.played) {
-            // Load the existing game state
-            loadGameState();
-            
-            if (todayGameState.gameOver) {
-                setTimeout(() => {
-                    displayGameOver(todayGameState.won);
-                }, 500);
-            }
-        }
-    }
-    
-    // Create initial rows for the board
-    function createInitialRows() {
-        // Start with 6 rows (standard Wordle experience)
-        for (let i = 0; i < 6; i++) {
-            createRow(i);
+
+        startDaily();
+
+        // First visit: show how to play
+        if (!safeGet('wordleSeenHelp')) {
+            safeSet('wordleSeenHelp', '1');
+            showModal(modals.instructions);
         }
     }
-    
-    // Create a single row with the given index
-    function createRow(rowIndex) {
-        const row = document.createElement('div');
-        row.classList.add('row');
-        row.setAttribute('data-row', rowIndex);
-        
-        for (let j = 0; j < WORD_LENGTH; j++) {
-            const tile = document.createElement('div');
-            tile.classList.add('tile');
-            tile.setAttribute('data-row', rowIndex);
-            tile.setAttribute('data-col', j);
-            row.appendChild(tile);
-        }
-        
-        board.appendChild(row);
-        
-        // Scroll to the new row (both when loading and creating new rows)
-        if (rowIndex > 5) { // Only auto-scroll when adding rows beyond the initial set
-            scrollToRow(rowIndex);
-        }
-    }
-    
-    // Scroll to a specific row
-    function scrollToRow(rowIndex) {
-        const boardContainer = document.getElementById('board-container');
-        const row = document.querySelector(`.row[data-row="${rowIndex}"]`);
-        if (row) {
-            // Add a slight delay to ensure rendering is complete
-            setTimeout(() => {
-                // Calculate position to scroll the row fully into view
-                const containerRect = boardContainer.getBoundingClientRect();
-                const rowRect = row.getBoundingClientRect();
-                const offsetBottom = rowRect.bottom - containerRect.bottom;
-                
-                if (offsetBottom > 0) {
-                    // Need to scroll down to show the entire row
-                    boardContainer.scrollTop += offsetBottom + 10; // Add extra padding
-                }
-            }, 100);
-        }
-    }
-    
-    // Ensure we have enough rows for the current guess
-    function ensureRowExists(rowIndex) {
-        if (!document.querySelector(`.row[data-row="${rowIndex}"]`)) {
-            createRow(rowIndex);
-        }
-    }
-    
-    // Load words from the wordlist files
+
     async function loadWords() {
         try {
-            // Load answer words
-            const answersResponse = await fetch('answers.txt');
-            const answersText = await answersResponse.text();
-            answerWords = answersText.trim().split('\n');
-            
-            // Load allowed guesses
-            const guessesResponse = await fetch('allowed_guesses.txt');
-            const guessesText = await guessesResponse.text();
-            allowedGuesses = guessesText.trim().split('\n');
-            
-            // Select today's word
-            selectTodaysWord();
-            
+            const [aRes, gRes] = await Promise.all([fetch('answers.txt'), fetch('allowed_guesses.txt')]);
+            if (!aRes.ok || !gRes.ok) throw new Error('HTTP error');
+            answerWords = (await aRes.text()).split(/\r?\n/).map(w => w.trim().toLowerCase()).filter(w => w.length === WORD_LENGTH);
+            const guessWords = (await gRes.text()).split(/\r?\n/).map(w => w.trim().toLowerCase()).filter(Boolean);
+            allowedSet = new Set([...guessWords, ...answerWords]);
         } catch (error) {
             console.error('Error loading word lists:', error);
-            showMessage('単語リストの読み込みエラー。ページを更新してください。');
+            showMessage('ことばリストが よみこめません。ページを こうしん してね。', 6000);
         }
     }
-    
-    // Select a word based on today's date or test parameter
-    function selectTodaysWord() {
-        const today = new Date();
-        const dateString = `${today.getFullYear()}-${today.getMonth() + 1}-${today.getDate()}`;
-        
-        // Check URL for test parameter
-        const urlParams = new URLSearchParams(window.location.search);
-        const testWord = urlParams.get('test');
-        
-        if (testWord && testWord.length === WORD_LENGTH) {
-            // Use the test word and enable test mode
-            solution = testWord.toLowerCase();
-            testMode = true;
-            
-            // In test mode, we don't want to save the solution or state
-            return;
+
+    /* ============================================================
+       WORD SELECTION
+       ============================================================ */
+    // Shuffle the answer list in a fixed way, then step through it one word
+    // per day, so no word repeats until the whole list has been used.
+    function seededShuffle(list, seed) {
+        const arr = list.slice();
+        let s = seed >>> 0;
+        const rand = () => {
+            s = (s + 0x6D2B79F5) >>> 0;
+            let t = s;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+        for (let i = arr.length - 1; i > 0; i--) {
+            const j = Math.floor(rand() * (i + 1));
+            [arr[i], arr[j]] = [arr[j], arr[i]];
         }
-        
-        // If we already have a solution for today, use it
-        if (todayGameState.date === dateString && todayGameState.solution) {
+        return arr;
+    }
+
+    function wordForToday() {
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const dayIndex = Math.round((today - EPOCH) / 86400000);
+        const order = seededShuffle(answerWords, 20250101);
+        const n = order.length;
+        return order[((dayIndex % n) + n) % n];
+    }
+
+    /* ============================================================
+       GAME MODES
+       ============================================================ */
+    function startDaily() {
+        practiceMode = false;
+        hideModal(modals.gameOver);
+        todayGameState = loadTodayState();
+
+        if (todayGameState.date === todayKey() && todayGameState.solution) {
             solution = todayGameState.solution;
+        } else {
+            solution = wordForToday();
+            todayGameState = { date: todayKey(), solution, played: false, gameOver: false, won: false, guesses: [], hintsUsed: 0 };
+            saveTodayState();
+        }
+
+        resetBoard();
+        updateModeBadge();
+
+        // Restore earlier guesses from today
+        hintsUsed = todayGameState.hintsUsed || 0;
+        todayGameState.guesses.forEach((g, r) => {
+            ensureRowExists(r);
+            for (let c = 0; c < WORD_LENGTH; c++) {
+                const tile = getTile(r, c);
+                tile.textContent = g.word[c];
+                tile.classList.add('filled', g.results[c]);
+            }
+            updateKeyboard(g.word.split(''), g.results);
+        });
+        guesses = todayGameState.guesses.slice();
+        currentRow = guesses.length;
+        ensureRowExists(currentRow);
+        updateHintButton();
+        showUsedHints();
+
+        if (todayGameState.gameOver) {
+            gameOver = true;
+            // The winning guess is the last one, so don't leave an empty row
+            removeEmptyRowsAfter(guesses.length - 1);
+            setTimeout(() => displayGameOver(), 400);
+        }
+        setTimeout(() => scrollToRow(currentRow), 200);
+    }
+
+    function startPractice() {
+        practiceMode = true;
+        hideModal(modals.gameOver);
+        hideModal(modals.statistics);
+        const pool = answerWords.filter(w => w !== solution && w !== todayGameState.solution);
+        solution = pool[Math.floor(Math.random() * pool.length)];
+        resetBoard();
+        updateModeBadge();
+        showMessage('れんしゅう モード！ 🎯', 1500);
+    }
+
+    function resetBoard() {
+        board.innerHTML = '';
+        for (let i = 0; i < VISIBLE_ROWS; i++) createRow(i);
+        boardContainer.scrollTop = 0;
+        document.querySelectorAll('#keyboard-container button[data-key]').forEach(b => {
+            b.classList.remove('correct', 'present', 'absent');
+        });
+        currentRow = 0;
+        currentTile = 0;
+        gameOver = false;
+        isAnimating = false;
+        guesses = [];
+        hintsUsed = 0;
+        hintBox.innerHTML = '';
+        hintBox.classList.remove('show');
+        updateHintButton();
+    }
+
+    function updateModeBadge() {
+        if (practiceMode) {
+            modeBadge.textContent = '🎯 れんしゅう';
+            modeBadge.className = 'mode-badge practice';
+        } else {
+            modeBadge.textContent = '📅 きょうの ことば';
+            modeBadge.className = 'mode-badge daily';
+        }
+    }
+
+    /* ============================================================
+       BOARD
+       ============================================================ */
+    function createRow(rowIndex) {
+        const row = document.createElement('div');
+        row.className = 'row';
+        row.dataset.row = rowIndex;
+        for (let j = 0; j < WORD_LENGTH; j++) {
+            const tile = document.createElement('div');
+            tile.className = 'tile';
+            tile.dataset.row = rowIndex;
+            tile.dataset.col = j;
+            row.appendChild(tile);
+        }
+        board.appendChild(row);
+    }
+
+    function ensureRowExists(rowIndex) {
+        while (board.children.length <= rowIndex) createRow(board.children.length);
+    }
+
+    function removeEmptyRowsAfter(rowIndex) {
+        // Only trims rows beyond the starting 6 so the board keeps its shape
+        while (board.children.length > Math.max(VISIBLE_ROWS, rowIndex + 1)) {
+            board.lastElementChild.remove();
+        }
+    }
+
+    function scrollToRow(rowIndex) {
+        const row = board.children[rowIndex];
+        if (!row) return;
+        const cRect = boardContainer.getBoundingClientRect();
+        const rRect = row.getBoundingClientRect();
+        if (rRect.bottom > cRect.bottom) {
+            boardContainer.scrollTop += rRect.bottom - cRect.bottom + 12;
+        } else if (rRect.top < cRect.top) {
+            boardContainer.scrollTop -= cRect.top - rRect.top + 12;
+        }
+    }
+
+    function getTile(row, col) {
+        const r = board.children[row];
+        return r ? r.children[col] : null;
+    }
+
+    /* ============================================================
+       INPUT
+       ============================================================ */
+    function handleKeyPress(e) {
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        if (document.querySelector('.modal.open')) {
+            if (e.key === 'Escape') document.querySelectorAll('.modal.open').forEach(hideModal);
             return;
         }
-        
-        // Otherwise, select a new word from the answers list
-        const seed = dateString;
-        const randomIndex = getRandomIndexFromSeed(seed, answerWords.length);
-        solution = answerWords[randomIndex].toLowerCase().trim();
-        
-        // Save today's solution
-        todayGameState.date = dateString;
-        todayGameState.solution = solution;
-        saveTodayGameState();
-    }
-    
-    // Generate a random index from a seed value
-    function getRandomIndexFromSeed(seed, max) {
-        let hash = 0;
-        for (let i = 0; i < seed.length; i++) {
-            const char = seed.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
-            hash = hash & hash; // Convert to 32bit integer
-        }
-        
-        // Make sure the hash is positive and within range
-        return Math.abs(hash) % max;
-    }
-    
-    // Handle physical keyboard input
-    function handleKeyPress(e) {
         if (gameOver || isAnimating) return;
-        
+
         const key = e.key.toLowerCase();
-        
         if (key === 'backspace') {
+            e.preventDefault();
             deleteLetter();
+        } else if (key === 'enter') {
+            e.preventDefault();
+            submitGuess();
         } else if (/^[a-z]$/.test(key)) {
             addLetter(key);
+            pressKeyVisual(key);
         }
     }
-    
-    // Handle on-screen keyboard clicks
+
     function handleKeyClick(e) {
-        if (gameOver || isAnimating) return;
-        
-        const target = e.target;
-        if (!target.matches('button')) return;
-        
-        const key = target.getAttribute('data-key');
-        
-        if (key === 'backspace') {
-            deleteLetter();
-        } else if (key !== 'enter') { // Ignore enter key clicks
-            addLetter(key);
-        }
+        const target = e.target.closest('button[data-key]');
+        if (!target || gameOver || isAnimating) return;
+        const key = target.dataset.key;
+        if (key === 'backspace') deleteLetter();
+        else if (key === 'enter') submitGuess();
+        else addLetter(key);
     }
-    
-    // Add a letter to the current position
+
+    function pressKeyVisual(key) {
+        const btn = keyboard.querySelector(`button[data-key="${key}"]`);
+        if (!btn) return;
+        btn.classList.add('pressed');
+        setTimeout(() => btn.classList.remove('pressed'), 120);
+    }
+
     function addLetter(letter) {
-        if (currentTile < WORD_LENGTH) {
-            // Make sure we have a row for the current guess
-            ensureRowExists(currentRow);
-            
-            const tile = getTileElement(currentRow, currentTile);
-            tile.textContent = letter;
-            tile.classList.add('filled');
-            
-            currentTile++;
-            
-            // Auto-submit when we have 5 letters
-            if (currentTile === WORD_LENGTH) {
-                submitGuess();
-            }
-        }
+        if (currentTile >= WORD_LENGTH) return;
+        ensureRowExists(currentRow);
+        const tile = getTile(currentRow, currentTile);
+        tile.textContent = letter;
+        tile.classList.add('filled');
+        currentTile++;
+        playSound('type');
+        if (currentTile === WORD_LENGTH) submitGuess();   // auto-submit at 5 letters
     }
-    
-    // Delete the last letter
+
     function deleteLetter() {
-        if (currentTile > 0) {
-            currentTile--;
-            const tile = getTileElement(currentRow, currentTile);
-            tile.textContent = '';
-            tile.classList.remove('filled');
-        }
+        if (currentTile <= 0) return;
+        currentTile--;
+        const tile = getTile(currentRow, currentTile);
+        tile.textContent = '';
+        tile.classList.remove('filled');
     }
-    
-    // Submit the current guess
+
+    /* ============================================================
+       GUESSING
+       ============================================================ */
     function submitGuess() {
-        // Check if the row is complete (should always be true with auto-submit)
+        if (gameOver || isAnimating) return;
         if (currentTile !== WORD_LENGTH) {
-            return;
-        }
-        
-        // Get the current word
-        let word = '';
-        for (let i = 0; i < WORD_LENGTH; i++) {
-            word += getTileElement(currentRow, i).textContent;
-        }
-        word = word.toLowerCase();
-        
-        // Check if word is in the list of allowed guesses or answers
-        if (!answerWords.some(w => w.trim().toLowerCase() === word) && 
-            !allowedGuesses.some(w => w.trim().toLowerCase() === word)) {
-            showMessage('単語リストにありません');
+            showMessage('5もじ いれてね');
             shakeRow(currentRow);
-            // Clear the current guess so the user can try again
-            for (let i = 0; i < WORD_LENGTH; i++) {
-                const tile = getTileElement(currentRow, i);
-                tile.textContent = '';
-                tile.classList.remove('filled');
-            }
-            currentTile = 0;
             return;
         }
-        
-        // Evaluate the guess and animate tiles
+
+        let word = '';
+        for (let i = 0; i < WORD_LENGTH; i++) word += getTile(currentRow, i).textContent;
+        word = word.toLowerCase();
+
+        if (!allowedSet.has(word)) {
+            // Keep the letters so the student only has to fix the mistake
+            showMessage('リストに ない ことばだよ。⌫ で なおしてね', 2200);
+            shakeRow(currentRow);
+            playSound('bad');
+            return;
+        }
+
         isAnimating = true;
-        evaluateGuess(word);
+        const results = scoreGuess(word, solution);
+        animateTiles(currentRow, results, () => afterReveal(word, results));
     }
-    
-    // Evaluate the current guess
-    function evaluateGuess(guess) {
-        const solutionChars = solution.split('');
-        const guessChars = guess.split('');
-        
-        // Create a map to track letter frequencies in the solution
-        const letterFrequency = {};
-        solutionChars.forEach(char => {
-            letterFrequency[char] = (letterFrequency[char] || 0) + 1;
-        });
-        
-        // First pass: Find correct placements
+
+    function scoreGuess(guess, answer) {
         const results = Array(WORD_LENGTH).fill('absent');
+        const remaining = {};
         for (let i = 0; i < WORD_LENGTH; i++) {
-            if (guessChars[i] === solutionChars[i]) {
-                results[i] = 'correct';
-                letterFrequency[guessChars[i]]--;
-            }
+            if (guess[i] === answer[i]) results[i] = 'correct';
+            else remaining[answer[i]] = (remaining[answer[i]] || 0) + 1;
         }
-        
-        // Second pass: Find present but wrong position
         for (let i = 0; i < WORD_LENGTH; i++) {
-            if (results[i] === 'absent' && letterFrequency[guessChars[i]] && letterFrequency[guessChars[i]] > 0) {
+            if (results[i] !== 'correct' && remaining[guess[i]] > 0) {
                 results[i] = 'present';
-                letterFrequency[guessChars[i]]--;
+                remaining[guess[i]]--;
             }
         }
-        
-        // Animate tiles and update keyboard
-        animateTiles(currentRow, results, () => {
-            // Store the guess result
-            todayGameState.guesses.push({
-                word: guess,
-                results: results
-            });
-            
-            // Update keyboard colors
-            updateKeyboard(guessChars, results);
-            
-            // Check if the game is over
-            const isCorrect = results.every(result => result === 'correct');
-            if (isCorrect) {
-                gameWon();
-            } else {
-                // Move to the next row (infinite guesses)
-                currentRow++;
-                currentTile = 0;
-                isAnimating = false;
-                
-                // Create the next row immediately
-                ensureRowExists(currentRow);
-                
-                // Ensure we scroll to show the new row properly
-                scrollToRow(currentRow);
-                
-                // Save game state
-                saveTodayGameState();
-            }
-        });
+        return results;
     }
-    
-    // Animate the tiles flipping
+
+    function afterReveal(word, results) {
+        guesses.push({ word, results });
+        updateKeyboard(word.split(''), results);
+
+        if (results.every(r => r === 'correct')) {
+            gameWon();
+            return;
+        }
+
+        currentRow++;
+        currentTile = 0;
+        isAnimating = false;
+        ensureRowExists(currentRow);
+        setTimeout(() => scrollToRow(currentRow), 50);
+
+        if (!practiceMode && !testMode) {
+            todayGameState.played = true;
+            saveTodayState();
+        }
+
+        // Friendly nudge when a hint becomes available
+        if ([HINT_EMOJI_AFTER, HINT_MEANING_AFTER, HINT_LETTER_AFTER].includes(guesses.length)) {
+            showMessage('💡 ヒントが つかえるよ！', 1800);
+        }
+        updateHintButton();
+    }
+
     function animateTiles(row, results, callback) {
-        let delay = 0;
-        
         for (let i = 0; i < WORD_LENGTH; i++) {
-            const tile = getTileElement(row, i);
-            
+            const tile = getTile(row, i);
             setTimeout(() => {
                 tile.classList.add('flip');
-                
                 setTimeout(() => {
                     tile.classList.add(results[i]);
-                    
-                    // When the last tile is done, call the callback
-                    if (i === WORD_LENGTH - 1) {
-                        setTimeout(callback, 500);
-                    }
-                }, 250); // Mid-flip
-            }, delay);
-            
-            delay += 250;
+                    playSound(results[i]);
+                }, 250);
+                setTimeout(() => tile.classList.remove('flip'), 500);
+                if (i === WORD_LENGTH - 1) setTimeout(callback, 550);
+            }, i * 250);
         }
     }
-    
-    // Update keyboard colors
-    function updateKeyboard(guessChars, results) {
-        for (let i = 0; i < WORD_LENGTH; i++) {
-            const key = guessChars[i];
-            const keyButton = document.querySelector(`button[data-key="${key}"]`);
+
+    function updateKeyboard(letters, results) {
+        letters.forEach((key, i) => {
+            const btn = keyboard.querySelector(`button[data-key="${key}"]`);
+            if (!btn) return;
             const result = results[i];
-            
-            if (keyButton) {
-                // Only upgrade the key color (absent → present → correct)
-                if (result === 'correct') {
-                    keyButton.classList.remove('present', 'absent');
-                    keyButton.classList.add('correct');
-                } else if (result === 'present' && !keyButton.classList.contains('correct')) {
-                    keyButton.classList.remove('absent');
-                    keyButton.classList.add('present');
-                } else if (!keyButton.classList.contains('correct') && !keyButton.classList.contains('present')) {
-                    keyButton.classList.add('absent');
-                }
+            if (result === 'correct') {
+                btn.classList.remove('present', 'absent');
+                btn.classList.add('correct');
+            } else if (result === 'present' && !btn.classList.contains('correct')) {
+                btn.classList.remove('absent');
+                btn.classList.add('present');
+            } else if (result === 'absent' && !btn.classList.contains('correct') && !btn.classList.contains('present')) {
+                btn.classList.add('absent');
             }
+        });
+    }
+
+    /* ============================================================
+       HINTS
+       ============================================================ */
+    function hintLevelsUnlocked() {
+        let n = 0;
+        if (guesses.length >= HINT_EMOJI_AFTER) n = 1;
+        if (guesses.length >= HINT_MEANING_AFTER) n = 2;
+        if (guesses.length >= HINT_LETTER_AFTER) n = 3;
+        return n;
+    }
+
+    function updateHintButton() {
+        const unlocked = hintLevelsUnlocked();
+        const canUse = !gameOver && hintsUsed < unlocked;
+        hintBtn.disabled = !canUse;
+        hintBtn.classList.toggle('ready', canUse);
+        if (hintsUsed >= 3) {
+            hintBtn.textContent = '💡 ヒント おわり';
+        } else if (canUse) {
+            hintBtn.textContent = `💡 ヒント ${hintsUsed + 1}`;
+        } else {
+            const need = [HINT_EMOJI_AFTER, HINT_MEANING_AFTER, HINT_LETTER_AFTER][hintsUsed] - guesses.length;
+            hintBtn.textContent = gameOver ? '💡 ヒント' : `💡 あと ${need}かい`;
         }
     }
-    
-    // Handle a game win
+
+    function hintHtml(level) {
+        const info = WORD_INFO[solution] || [];
+        if (level === 1) return `<span class="hint-chip">${info[0] || '❓'}</span>`;
+        if (level === 2) return `<span class="hint-chip">${info[1] || '???'}</span>`;
+        return `<span class="hint-chip">さいしょの もじ: <b>${solution[0].toUpperCase()}</b></span>`;
+    }
+
+    function showUsedHints() {
+        hintBox.innerHTML = '';
+        for (let i = 1; i <= hintsUsed; i++) hintBox.insertAdjacentHTML('beforeend', hintHtml(i));
+        hintBox.classList.toggle('show', hintsUsed > 0);
+    }
+
+    function useHint() {
+        if (hintBtn.disabled) return;
+        hintsUsed++;
+        showUsedHints();
+        playSound('hint');
+        updateHintButton();
+        saveTodayState();
+    }
+
+    /* ============================================================
+       WIN
+       ============================================================ */
     function gameWon() {
         gameOver = true;
         isAnimating = false;
-        
-        // Update statistics
-        gameStats.played++;
-        gameStats.wins++;
-        gameStats.currentStreak++;
-        gameStats.maxStreak = Math.max(gameStats.maxStreak, gameStats.currentStreak);
-        
-        // Check if we need to extend the distribution array
-        if (currentRow >= Object.keys(gameStats.distribution).length) {
-            gameStats.distribution[currentRow] = 1;
-        } else {
-            gameStats.distribution[currentRow] = (gameStats.distribution[currentRow] || 0) + 1;
+        const tries = guesses.length;
+
+        if (!practiceMode && !testMode) {
+            const today = todayKey();
+            if (gameStats.lastWinDate !== today) {
+                gameStats.played++;
+                gameStats.wins++;
+                // Streak only continues if the last win was yesterday
+                gameStats.currentStreak = gameStats.lastWinDate === yesterdayKey() ? gameStats.currentStreak + 1 : 1;
+                gameStats.maxStreak = Math.max(gameStats.maxStreak, gameStats.currentStreak);
+                const idx = tries - 1; // stored 0-based, like the original version
+                gameStats.distribution[idx] = (gameStats.distribution[idx] || 0) + 1;
+                gameStats.lastWinDate = today;
+                saveStats();
+            }
+            todayGameState.played = true;
+            todayGameState.gameOver = true;
+            todayGameState.won = true;
+            saveTodayState();
         }
-        
-        saveGameStats();
-        
-        // Mark the game as complete
-        todayGameState.played = true;
-        todayGameState.gameOver = true;
-        todayGameState.won = true;
-        saveTodayGameState();
-        
-        // Show win message
+
+        removeEmptyRowsAfter(currentRow);
+        updateHintButton();
+        bounceRow(currentRow);
+        playSound('win');
         setTimeout(() => {
-            displayGameOver(true);
-        }, 1500);
+            confetti();
+            displayGameOver();
+        }, 1200);
     }
-    
-    // Handle a game loss
-    function gameLost() {
-        // This function is no longer needed as we have infinite guesses
-        // It's kept for compatibility but should never be called
+
+    function praiseFor(tries) {
+        if (tries === 1) return 'てんさい！ 🤯';
+        if (tries === 2) return 'すごすぎる！ 🌟';
+        if (tries === 3) return 'すばらしい！ 🎉';
+        if (tries === 4) return 'すごい！ 😄';
+        if (tries <= 6) return 'よくできました！ 👏';
+        if (tries <= 10) return 'がんばったね！ 💪';
+        return 'あきらめなかったね！ 🏅';
     }
-    
-    // Display game over modal
-    function displayGameOver(won) {
-        document.getElementById('game-over-message').textContent = 
-            `${currentRow + 1}回で正解しました！`;
-        document.getElementById('solution-word').textContent = solution;
-        
-        // Update the countdown
-        updateCountdown('game-over-countdown');
-        
+
+    function displayGameOver() {
+        const tries = guesses.length;
+        const info = WORD_INFO[solution] || ['📖', ''];
+        $('game-over-title').textContent = praiseFor(tries);
+        $('game-over-message').textContent = `${tries}かいで せいかい！` + (hintsUsed ? `（ヒント ${hintsUsed}こ）` : '');
+        $('word-emoji').textContent = info[0];
+        $('solution-word').textContent = solution.toUpperCase();
+        $('word-meaning').textContent = info[1];
+
+        $('share-result').style.display = practiceMode || testMode ? 'none' : '';
+        $('daily-countdown-box').style.display = practiceMode ? 'none' : '';
+        $('daily-btn').style.display = practiceMode && !todayGameState.gameOver ? '' : 'none';
+        updateCountdown();
         showModal(modals.gameOver);
     }
-    
-    // Share results
+
+    /* ============================================================
+       SHARE / STATS / COUNTDOWN
+       ============================================================ */
     function shareResults() {
-        const emoji = {
-            'correct': '🟩',
-            'present': '🟨',
-            'absent': '⬛'
-        };
-        
-        let text = `Wordle Clone ${todayGameState.date} ${currentRow + 1} guesses\n\n`;
-        
-        for (const guess of todayGameState.guesses) {
-            text += guess.results.map(result => emoji[result]).join('') + '\n';
+        const emoji = { correct: '🟩', present: '🟨', absent: '⬜' };
+        let text = `NEW HORIZON WORDLE ${todayGameState.date} ${guesses.length}かい\n\n`;
+        text += guesses.map(g => g.results.map(r => emoji[r]).join('')).join('\n');
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text)
+                .then(() => showMessage('コピーしたよ！ 📋'))
+                .catch(() => showMessage('コピー できませんでした'));
+        } else {
+            showMessage('コピー できませんでした');
         }
-        
-        // Copy to clipboard
-        navigator.clipboard.writeText(text).then(() => {
-            showMessage('結果がクリップボードにコピーされました！');
-        }).catch(() => {
-            showMessage('結果のコピーに失敗しました');
+    }
+
+    function updateStatistics() {
+        $('played').textContent = gameStats.played;
+        $('win-percentage').textContent = gameStats.played ? Math.round(gameStats.wins / gameStats.played * 100) : 0;
+        $('current-streak').textContent = currentStreakValue();
+        $('max-streak').textContent = gameStats.maxStreak;
+
+        const container = $('guess-distribution');
+        container.innerHTML = '';
+        const keys = Object.keys(gameStats.distribution).map(Number).sort((a, b) => a - b);
+        if (!keys.length) {
+            container.innerHTML = '<p class="empty-stats">まだ データが ないよ。きょうの ことばに チャレンジ！</p>';
+        }
+        const maxValue = Math.max(1, ...Object.values(gameStats.distribution));
+        const todayIdx = todayGameState.won ? todayGameState.guesses.length - 1 : -1;
+        for (const i of keys) {
+            const count = gameStats.distribution[i] || 0;
+            const bar = document.createElement('div');
+            bar.className = 'guess-bar';
+            bar.innerHTML = `<div class="guess-label">${i + 1}</div>`;
+            const countEl = document.createElement('div');
+            countEl.className = 'guess-count' + (i === todayIdx ? ' today' : '');
+            countEl.textContent = count;
+            countEl.style.width = `${Math.max(8, (count / maxValue) * 100)}%`;
+            bar.appendChild(countEl);
+            container.appendChild(bar);
+        }
+        updateCountdown();
+    }
+
+    function currentStreakValue() {
+        // A streak is only "live" if the last win was today or yesterday
+        const last = gameStats.lastWinDate;
+        if (last && last !== todayKey() && last !== yesterdayKey()) return 0;
+        return gameStats.currentStreak;
+    }
+
+    function updateCountdown() {
+        const now = new Date();
+        const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+        const left = tomorrow - now;
+        const h = Math.floor(left / 3600000);
+        const m = Math.floor((left % 3600000) / 60000);
+        const s = Math.floor((left % 60000) / 1000);
+        const text = [h, m, s].map(n => String(n).padStart(2, '0')).join(':');
+        $('countdown').textContent = text;
+        $('game-over-countdown').textContent = text;
+    }
+    setInterval(() => {
+        if (document.querySelector('.modal.open')) updateCountdown();
+        // If the day rolls over while the page is open, load the new word
+        if (!practiceMode && !testMode && todayGameState.date && todayGameState.date !== todayKey()) startDaily();
+    }, 1000);
+
+    /* ============================================================
+       UI HELPERS
+       ============================================================ */
+    function showMessage(message, duration = 1800) {
+        messageContainer.textContent = message;
+        messageContainer.classList.add('show');
+        clearTimeout(messageTimer);
+        messageTimer = setTimeout(() => messageContainer.classList.remove('show'), duration);
+    }
+
+    function shakeRow(row) {
+        const el = board.children[row];
+        if (!el) return;
+        el.classList.remove('shake');
+        void el.offsetWidth; // restart animation
+        el.classList.add('shake');
+        setTimeout(() => el.classList.remove('shake'), 500);
+    }
+
+    function bounceRow(row) {
+        const el = board.children[row];
+        if (!el) return;
+        Array.from(el.children).forEach((tile, i) => {
+            setTimeout(() => tile.classList.add('bounce'), i * 100);
         });
     }
 
-    // Get a tile element by row and column
-    function getTileElement(row, col) {
-        return document.querySelector(`.tile[data-row="${row}"][data-col="${col}"]`);
+    function showModal(modal) { modal.classList.add('open'); }
+    function hideModal(modal) { if (modal) modal.classList.remove('open'); }
+
+    /* ============================================================
+       CONFETTI (no library needed)
+       ============================================================ */
+    function confetti() {
+        const canvas = $('confetti');
+        const ctx = canvas.getContext('2d');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        const colors = ['#6aaa64', '#c9b458', '#ff5c8a', '#3fa9f5', '#ff9f1c', '#9b5de5'];
+        const pieces = Array.from({ length: 140 }, () => ({
+            x: canvas.width / 2 + (Math.random() - 0.5) * 200,
+            y: canvas.height / 3,
+            vx: (Math.random() - 0.5) * 14,
+            vy: Math.random() * -14 - 4,
+            size: 6 + Math.random() * 6,
+            color: colors[Math.floor(Math.random() * colors.length)],
+            rot: Math.random() * 360,
+            vr: (Math.random() - 0.5) * 12
+        }));
+        let frame = 0;
+        (function tick() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            pieces.forEach(p => {
+                p.vy += 0.35;
+                p.vx *= 0.99;
+                p.x += p.vx;
+                p.y += p.vy;
+                p.rot += p.vr;
+                ctx.save();
+                ctx.translate(p.x, p.y);
+                ctx.rotate(p.rot * Math.PI / 180);
+                ctx.fillStyle = p.color;
+                ctx.fillRect(-p.size / 2, -p.size / 4, p.size, p.size / 2);
+                ctx.restore();
+            });
+            if (++frame < 180) requestAnimationFrame(tick);
+            else ctx.clearRect(0, 0, canvas.width, canvas.height);
+        })();
     }
-    
-    // Show a message to the user
-    function showMessage(message, duration = 2000) {
-        messageContainer.textContent = message;
-        messageContainer.classList.add('show');
-        
-        setTimeout(() => {
-            messageContainer.classList.remove('show');
-        }, duration);
+
+    /* ============================================================
+       SOUND (tiny beeps, toggle with the 🔊 button)
+       ============================================================ */
+    let audioCtx = null;
+    function tone(freq, start, dur, type = 'sine', vol = 0.08) {
+        const t = audioCtx.currentTime + start;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type;
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(vol, t);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+        osc.connect(gain).connect(audioCtx.destination);
+        osc.start(t);
+        osc.stop(t + dur);
     }
-    
-    // Shake a row when the guess is invalid
-    function shakeRow(row) {
-        const rowElement = board.children[row];
-        rowElement.style.animation = 'shake 0.5s';
-        
-        setTimeout(() => {
-            rowElement.style.animation = '';
-        }, 500);
-    }
-    
-    // Show a modal
-    function showModal(modal) {
-        modal.style.display = 'block';
-    }
-    
-    // Hide a modal
-    function hideModal(modal) {
-        modal.style.display = 'none';
-    }
-    
-    // Load the game state from the previous guesses
-    function loadGameState() {
-        // Create enough rows for all previous guesses plus one more for the next guess
-        for (let r = 0; r <= todayGameState.guesses.length; r++) {
-            ensureRowExists(r);
-        }
-        
-        // No extra row needed as ensureRowExists already creates the next row needed
-        
-        // Load previous guesses
-        for (let r = 0; r < todayGameState.guesses.length; r++) {
-            const guess = todayGameState.guesses[r];
-            const word = guess.word;
-            const results = guess.results;
-            
-            // Fill in the tiles
-            for (let c = 0; c < WORD_LENGTH; c++) {
-                const tile = getTileElement(r, c);
-                tile.textContent = word[c];
-                tile.classList.add('filled');
-                tile.classList.add(results[c]);
+    function playSound(kind) {
+        if (!soundOn) return;
+        try {
+            audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+            switch (kind) {
+                case 'type': tone(520, 0, 0.05, 'triangle', 0.04); break;
+                case 'correct': tone(880, 0, 0.15); break;
+                case 'present': tone(660, 0, 0.15); break;
+                case 'absent': tone(300, 0, 0.12, 'triangle', 0.05); break;
+                case 'bad': tone(200, 0, 0.18, 'square', 0.04); break;
+                case 'hint': tone(700, 0, 0.1); tone(1000, 0.1, 0.15); break;
+                case 'win': [523, 659, 784, 1047].forEach((f, i) => tone(f, i * 0.12, 0.3)); break;
             }
-            
-            // Update the keyboard
-            updateKeyboard(word.split(''), results);
-        }
-        
-        // Set the current row and tile
-        currentRow = todayGameState.guesses.length;
-        currentTile = 0;
-        
-        // Always scroll to current row to ensure it's visible
-        setTimeout(() => {
-            scrollToRow(currentRow);
-        }, 300); // Longer delay to make sure everything is rendered
-        
-        // If the game is over, set the game state
-        if (todayGameState.gameOver) {
-            gameOver = true;
-        }
+        } catch (e) { /* audio not available */ }
     }
-    
-    // Update the statistics display
-    function updateStatistics() {
-        document.getElementById('played').textContent = gameStats.played;
-        document.getElementById('win-percentage').textContent = gameStats.played > 0 ? 
-            Math.round((gameStats.wins / gameStats.played) * 100) : 0;
-        document.getElementById('current-streak').textContent = gameStats.currentStreak;
-        document.getElementById('max-streak').textContent = gameStats.maxStreak;
-        
-        // Update the guess distribution
-        const distributionContainer = document.getElementById('guess-distribution');
-        distributionContainer.innerHTML = '';
-        
-        // Find the max value in distribution
-        const maxValue = Math.max(...Object.values(gameStats.distribution));
-        
-        // Create distribution bars for all recorded guess counts
-        const guessNumbers = Object.keys(gameStats.distribution).map(Number).sort((a, b) => a - b);
-        for (const i of guessNumbers) {
-            const count = gameStats.distribution[i] || 0;
-            
-            const bar = document.createElement('div');
-            bar.classList.add('guess-bar');
-            
-            const label = document.createElement('div');
-            label.classList.add('guess-label');
-            label.textContent = i + 1;
-            
-            const countElement = document.createElement('div');
-            countElement.classList.add('guess-count');
-            if (count === maxValue && count > 0) {
-                countElement.classList.add('max');
-            }
-            countElement.textContent = count;
-            countElement.style.width = count > 0 ? `${(count / maxValue) * 100}%` : '30px';
-            
-            bar.appendChild(label);
-            bar.appendChild(countElement);
-            distributionContainer.appendChild(bar);
-        }
-        
-        // Update the countdown
-        updateCountdown('countdown');
+    function toggleSound() {
+        soundOn = !soundOn;
+        safeSet('wordleSound', soundOn ? 'on' : 'off');
+        updateSoundButton();
+        if (soundOn) playSound('hint');
     }
-    
-    // Update the countdown to the next day
-    function updateCountdown(elementId) {
-        const now = new Date();
-        const tomorrow = new Date();
-        tomorrow.setDate(tomorrow.getDate() + 1);
-        tomorrow.setHours(0, 0, 0, 0);
-        
-        const timeLeft = tomorrow - now;
-        
-        const hours = Math.floor(timeLeft / (1000 * 60 * 60));
-        const minutes = Math.floor((timeLeft % (1000 * 60 * 60)) / (1000 * 60));
-        const seconds = Math.floor((timeLeft % (1000 * 60)) / 1000);
-        
-        document.getElementById(elementId).textContent = 
-            `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-        
-        if (elementId === 'countdown') {
-            setTimeout(() => updateCountdown(elementId), 1000);
-        }
+    function updateSoundButton() {
+        const btn = $('sound-toggle');
+        btn.textContent = soundOn ? '🔊' : '🔇';
+        btn.title = soundOn ? 'おと オン' : 'おと オフ';
     }
-    
-    // Get game statistics from local storage
-    function getGameStats() {
-        const stats = localStorage.getItem('wordleStats');
-        
-        if (stats) {
-            return JSON.parse(stats);
-        } else {
-            // Default statistics with an empty distribution object
-            // to handle infinite attempts
-            return {
-                played: 0,
-                wins: 0,
-                currentStreak: 0,
-                maxStreak: 0,
-                distribution: {}
-            };
-        }
-    }
-    
-    // Save game statistics to local storage
-    function saveGameStats() {
-        // Don't save stats if we're in test mode
-        if (testMode) return;
-        
-        localStorage.setItem('wordleStats', JSON.stringify(gameStats));
-    }
-    
-    // Get today's game state from local storage
-    function getTodayGameState() {
-        const state = localStorage.getItem('wordleState');
-        
-        if (state) {
-            const savedState = JSON.parse(state);
-            const today = new Date();
-            const dateString = `${today.getFullYear()}-${today.getMonth() + 1}-${today.getDate()}`;
-            
-            // Check if the saved state is from today
-            if (savedState.date === dateString) {
-                return savedState;
-            }
-        }
-        
-        // Default game state
-        return {
-            date: '',
-            solution: '',
-            played: false,
-            gameOver: false,
-            won: false,
-            guesses: []
-        };
-    }
-    
-    // Save today's game state to local storage
-    function saveTodayGameState() {
-        // Don't save the state if we're in test mode
-        if (testMode) return;
-        
-        localStorage.setItem('wordleState', JSON.stringify(todayGameState));
-    }
-    
-    // Initialize the game when the DOM is loaded
+
     initializeGame();
 });
